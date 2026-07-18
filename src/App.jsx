@@ -2,8 +2,9 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
-  signInAnonymously, 
-  signInWithCustomToken, 
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut,
   onAuthStateChanged 
 } from 'firebase/auth';
 import { 
@@ -54,6 +55,12 @@ const formatCurrency = (amount) => {
 
 export default function App() {
   const [user, setUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authMode, setAuthMode] = useState('login'); // 'login' | 'signup'
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [syncStatus, setSyncStatus] = useState('synced'); // 'synced', 'pending', 'offline'
   
@@ -74,8 +81,6 @@ export default function App() {
   const [activeDevTab, setActiveDevTab] = useState('env'); // 'env' | 'rules'
   
   // Form variables
-  const [customSyncIdInput, setCustomSyncIdInput] = useState('');
-  const [syncCodeError, setSyncCodeError] = useState('');
   const [txId, setTxId] = useState(null);
   const [txDate, setTxDate] = useState(getTodayDateString());
   const [txSector, setTxSector] = useState('Food');
@@ -135,43 +140,61 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const initAuth = async () => {
-      const customUid = localStorage.getItem('exp_v2_user_uid');
-      if (customUid) {
-        setUser({ uid: customUid });
-      } else {
-        try {
-          if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-            await signInWithCustomToken(auth, __initial_auth_token);
-          } else if (firebaseConfig.apiKey !== "mock-api-key") {
-            await signInAnonymously(auth);
-          }
-        } catch (err) {
-          console.warn("Auth initialization skipped or using sandbox parameters", err);
-        }
-      }
-    };
-    initAuth();
-
     const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
-      if (firebaseUser) {
-        if (!localStorage.getItem('exp_v2_user_uid')) {
-          setUser(firebaseUser);
-        }
-      } else {
-        let fallbackId = localStorage.getItem('exp_v2_user_uid');
-        if (!fallbackId) {
-          fallbackId = 'user_' + Math.random().toString(36).substring(2, 15);
-          localStorage.setItem('exp_v2_user_uid', fallbackId);
-        }
-        setUser({ uid: fallbackId });
-      }
+      setUser(firebaseUser || null);
+      setAuthChecked(true);
     });
     return () => unsubscribe();
   }, []);
 
+  const handleSignup = async (e) => {
+    e.preventDefault();
+    setAuthError('');
+    if (!authEmail || !authPassword) {
+      setAuthError('Enter an email and password.');
+      return;
+    }
+    if (authPassword.length < 6) {
+      setAuthError('Password must be at least 6 characters.');
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      await createUserWithEmailAndPassword(auth, authEmail.trim(), authPassword);
+    } catch (err) {
+      setAuthError(err.message.replace('Firebase: ', ''));
+    }
+    setAuthBusy(false);
+  };
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setAuthError('');
+    if (!authEmail || !authPassword) {
+      setAuthError('Enter an email and password.');
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      await signInWithEmailAndPassword(auth, authEmail.trim(), authPassword);
+    } catch (err) {
+      setAuthError(err.message.replace('Firebase: ', ''));
+    }
+    setAuthBusy(false);
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setExpenses({});
+      setBudgets({});
+    } catch (err) {
+      console.error('Logout error', err);
+    }
+  };
+
   useEffect(() => {
-    if (!user || firebaseConfig.apiKey === "mock-api-key") return;
+    if (!user || !firebaseConfig.apiKey) return;
     if (!isOnline) {
       setSyncStatus('offline');
       return;
@@ -290,7 +313,7 @@ export default function App() {
     }
 
     // Dynamic background replication to connected Firestore instances
-    if (isOnline && user && firebaseConfig.apiKey !== "mock-api-key") {
+    if (isOnline && user && !!firebaseConfig.apiKey) {
       setSyncStatus('pending');
       try {
         const itemRef = doc(db, 'artifacts', appId, 'users', user.uid, collectionName, id);
@@ -436,28 +459,6 @@ export default function App() {
       const payload = { ...targeted, deleted: true };
       saveRecordLocallyAndCloud('budgets', id, payload);
     }
-  };
-
-  const handleConnectSyncId = (e) => {
-    e.preventDefault();
-    const cleanId = customSyncIdInput.trim();
-    if (!cleanId) {
-      setSyncCodeError("ID value is required.");
-      return;
-    }
-    
-    localStorage.setItem('exp_v2_user_uid', cleanId);
-    setUser({ uid: cleanId });
-    setSyncCodeError('');
-    setIsSettingsOpen(false);
-    
-    setExpenses({});
-    setBudgets({});
-  };
-
-  const handleResetDeviceConnection = () => {
-    localStorage.removeItem('exp_v2_user_uid');
-    window.location.reload();
   };
 
   const triggerCopyNotice = (text, key) => {
@@ -701,6 +702,57 @@ export default function App() {
     });
   };
 
+  if (!authChecked) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+        <p className="text-slate-500 text-sm">Loading...</p>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-4 font-sans">
+        <div className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
+          <div className="text-center space-y-1">
+            <h1 className="text-xl font-bold text-emerald-400">Khoroch</h1>
+            <p className="text-xs text-slate-500">Personal expense tracker</p>
+          </div>
+          <form onSubmit={authMode === 'login' ? handleLogin : handleSignup} className="space-y-3">
+            <input
+              type="email"
+              placeholder="Email"
+              value={authEmail}
+              onChange={(e) => setAuthEmail(e.target.value)}
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-emerald-500"
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-emerald-500"
+            />
+            {authError && <p className="text-xs text-rose-400 font-semibold">{authError}</p>}
+            <button
+              type="submit"
+              disabled={authBusy}
+              className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm py-2.5 rounded-lg transition disabled:opacity-50"
+            >
+              {authBusy ? 'Please wait...' : authMode === 'login' ? 'Log in' : 'Sign up'}
+            </button>
+          </form>
+          <button
+            onClick={() => { setAuthMode(authMode === 'login' ? 'signup' : 'login'); setAuthError(''); }}
+            className="w-full text-center text-xs text-slate-500 hover:text-slate-300"
+          >
+            {authMode === 'login' ? "No account? Sign up" : "Have an account? Log in"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col antialiased selection:bg-emerald-500 selection:text-slate-950 font-sans pb-10">
       
@@ -719,17 +771,17 @@ export default function App() {
 
           <div className="flex items-center gap-2">
             <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border ${
-              syncStatus === 'synced' && firebaseConfig.apiKey !== "mock-api-key"
+              syncStatus === 'synced' && !!firebaseConfig.apiKey
                 ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-400' 
                 : syncStatus === 'pending'
                 ? 'bg-yellow-950/40 border-yellow-800/60 text-yellow-400 animate-pulse'
                 : 'bg-slate-900/60 border-slate-800/80 text-slate-400'
             }`}>
               <span className={`w-2 h-2 rounded-full ${
-                syncStatus === 'synced' && firebaseConfig.apiKey !== "mock-api-key" ? 'bg-emerald-400' : syncStatus === 'pending' ? 'bg-yellow-400' : 'bg-slate-600'
+                syncStatus === 'synced' && !!firebaseConfig.apiKey ? 'bg-emerald-400' : syncStatus === 'pending' ? 'bg-yellow-400' : 'bg-slate-600'
               }`} />
               <span className="hidden xs:inline capitalize">
-                {syncStatus === 'synced' && firebaseConfig.apiKey !== "mock-api-key" ? 'Synced' : syncStatus === 'pending' ? 'Syncing...' : 'Local Engine Only'}
+                {syncStatus === 'synced' && !!firebaseConfig.apiKey ? 'Synced' : syncStatus === 'pending' ? 'Syncing...' : 'Local Engine Only'}
               </span>
             </div>
 
@@ -1402,53 +1454,17 @@ export default function App() {
             </div>
 
             <div className="p-6 space-y-6 overflow-y-auto flex-1">
-              {/* Primary User Sync Connection Bubble */}
-              <div className="bg-slate-950 p-4 rounded-xl border border-slate-850 space-y-2">
-                <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wide">Dynamic Synchronization Key</h4>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    readOnly
-                    value={user?.uid || ''}
-                    onClick={(e) => e.target.select()}
-                    className="flex-1 bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-emerald-400 font-mono text-center select-all focus:outline-none"
-                  />
-                  <button
-                    onClick={() => triggerCopyNotice(user?.uid || '', 'uid')}
-                    className="p-2 rounded-lg bg-slate-850 hover:bg-slate-800 text-xs text-slate-300 font-bold transition shrink-0 min-w-[55px]"
-                  >
-                    {copiedText === 'uid' ? 'Copied' : 'Copy'}
-                  </button>
-                </div>
-                <p className="text-[10px] text-slate-500 leading-relaxed">
-                  Provide this key on other terminal browsers to securely aggregate and consolidate offline queues.
-                </p>
+              {/* Account */}
+              <div className="bg-slate-950 p-4 rounded-xl border border-slate-850 space-y-3">
+                <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wide">Account</h4>
+                <p className="text-xs text-slate-300 font-mono">{user?.email}</p>
+                <button
+                  onClick={handleLogout}
+                  className="w-full px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold rounded-lg transition"
+                >
+                  Log out
+                </button>
               </div>
-
-              {/* Terminal Connection Sync Input */}
-              <form onSubmit={handleConnectSyncId} className="space-y-3">
-                <div className="space-y-1">
-                  <label className="text-xs font-bold text-slate-400 block">Link to Remote Sync ID</label>
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      placeholder="Paste terminal Sync ID here"
-                      value={customSyncIdInput}
-                      onChange={(e) => setCustomSyncIdInput(e.target.value)}
-                      className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none"
-                    />
-                    <button
-                      type="submit"
-                      className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-extrabold rounded-lg transition"
-                    >
-                      Connect
-                    </button>
-                  </div>
-                  {syncCodeError && (
-                    <p className="text-[11px] text-rose-400 font-semibold mt-1">{syncCodeError}</p>
-                  )}
-                </div>
-              </form>
 
               {/* Export Section */}
               <div className="border-t border-slate-800 pt-4 flex items-center justify-between">
