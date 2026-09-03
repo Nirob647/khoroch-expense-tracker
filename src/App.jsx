@@ -10,9 +10,9 @@ import {
 import { 
   getFirestore, 
   doc, 
-  setDoc, 
   onSnapshot, 
-  collection 
+  collection,
+  runTransaction
 } from 'firebase/firestore';
 
 // Safely try to fetch from local environment variables or platform sandbox injection
@@ -36,6 +36,23 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'expense-tracker-v2';
+
+const LOCAL_STORAGE_KEYS = {
+  expenses: 'exp_v2_expenses',
+  sectors: 'exp_v2_sectors',
+  budgets: 'exp_v2_budgets'
+};
+
+const getRecordTime = (record) => Number(record?.updatedAt) || 0;
+
+const createExpenseId = ({ date, sector, subCategory, amount, note }) => {
+  const fingerprint = `${date}|${sector}|${subCategory}|${amount}|${note}`;
+  let hash = 0;
+  for (let index = 0; index < fingerprint.length; index += 1) {
+    hash = ((hash << 5) - hash + fingerprint.charCodeAt(index)) | 0;
+  }
+  return `tx_${(hash >>> 0).toString(36)}`;
+};
 
 const DEFAULT_SECTORS = [
   { id: 'sec-food', name: 'Food', subCategories: ['Breakfast', 'Lunch', 'Dinner'], custom: false, updatedAt: 1 },
@@ -193,6 +210,45 @@ export default function App() {
     }
   };
 
+  const applyLocalRecords = (collectionName, records) => {
+    const storageKey = LOCAL_STORAGE_KEYS[collectionName];
+    localStorage.setItem(storageKey, JSON.stringify(records));
+
+    if (collectionName === 'expenses') setExpenses(records);
+    else if (collectionName === 'sectors') setSectors(records);
+    else if (collectionName === 'budgets') setBudgets(records);
+  };
+
+  // A transaction makes conflict resolution consistent when multiple devices reconnect together.
+  // The record with the earliest saved timestamp is retained.
+  const syncRecord = async (collectionName, id, localItem) => {
+    const itemRef = doc(db, 'artifacts', appId, 'users', user.uid, collectionName, id);
+
+    return runTransaction(db, async (transaction) => {
+      const cloudSnapshot = await transaction.get(itemRef);
+      if (!cloudSnapshot.exists() || getRecordTime(localItem) < getRecordTime(cloudSnapshot.data())) {
+        transaction.set(itemRef, localItem);
+        return localItem;
+      }
+      return cloudSnapshot.data();
+    });
+  };
+
+  const syncLocalRecords = async () => {
+    const collections = ['expenses', 'sectors', 'budgets'];
+
+    for (const collectionName of collections) {
+      const localRecords = JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEYS[collectionName]) || '{}');
+      const syncedRecords = { ...localRecords };
+
+      await Promise.all(Object.entries(localRecords).map(async ([id, localItem]) => {
+        syncedRecords[id] = await syncRecord(collectionName, id, localItem);
+      }));
+
+      applyLocalRecords(collectionName, syncedRecords);
+    }
+  };
+
   useEffect(() => {
     if (!user || !firebaseConfig.apiKey) return;
     if (!isOnline) {
@@ -213,11 +269,9 @@ export default function App() {
           const cloudItem = doc.data();
           const localItem = prevExpenses[doc.id];
           
-          if (!localItem || cloudItem.updatedAt > localItem.updatedAt) {
+          if (!localItem || getRecordTime(cloudItem) < getRecordTime(localItem)) {
             updated[doc.id] = cloudItem;
             hasChanges = true;
-          } else if (localItem && localItem.updatedAt > cloudItem.updatedAt) {
-            setDoc(doc.ref, localItem).catch(e => console.error("Cloud catch-up write failure", e));
           }
         });
 
@@ -244,11 +298,9 @@ export default function App() {
           const cloudItem = doc.data();
           const localItem = prevSectors[doc.id];
 
-          if (!localItem || cloudItem.updatedAt > localItem.updatedAt) {
+          if (!localItem || getRecordTime(cloudItem) < getRecordTime(localItem)) {
             updated[doc.id] = cloudItem;
             hasChanges = true;
-          } else if (localItem && localItem.updatedAt > cloudItem.updatedAt) {
-            setDoc(doc.ref, localItem).catch(e => console.error("Cloud push custom sector error", e));
           }
         });
 
@@ -271,11 +323,9 @@ export default function App() {
           const cloudItem = doc.data();
           const localItem = prevBudgets[doc.id];
 
-          if (!localItem || cloudItem.updatedAt > localItem.updatedAt) {
+          if (!localItem || getRecordTime(cloudItem) < getRecordTime(localItem)) {
             updated[doc.id] = cloudItem;
             hasChanges = true;
-          } else if (localItem && localItem.updatedAt > cloudItem.updatedAt) {
-            setDoc(doc.ref, localItem).catch(e => console.error("Cloud push budgets error", e));
           }
         });
 
@@ -286,6 +336,13 @@ export default function App() {
         return prevBudgets;
       });
     }, () => {});
+
+    syncLocalRecords()
+      .then(() => setSyncStatus('synced'))
+      .catch((error) => {
+        console.warn('Unable to sync locally saved records after reconnecting', error);
+        setSyncStatus('offline');
+      });
 
     return () => {
       unsubExpenses();
@@ -316,8 +373,11 @@ export default function App() {
     if (isOnline && user && !!firebaseConfig.apiKey) {
       setSyncStatus('pending');
       try {
-        const itemRef = doc(db, 'artifacts', appId, 'users', user.uid, collectionName, id);
-        await setDoc(itemRef, timestampedData);
+        const savedRecord = await syncRecord(collectionName, id, timestampedData);
+        if (savedRecord !== timestampedData) {
+          const localRecords = JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEYS[collectionName]) || '{}');
+          applyLocalRecords(collectionName, { ...localRecords, [id]: savedRecord });
+        }
         setSyncStatus('synced');
       } catch (err) {
         console.warn("Background persistence failed, holding local copy", err);
@@ -332,12 +392,10 @@ export default function App() {
     e.preventDefault();
     if (!txAmount || isNaN(txAmount) || parseInt(txAmount) <= 0) return;
 
-    const targetId = txId || 'tx_' + Math.random().toString(36).substring(2, 15);
     const chosenSectorObj = Object.values(sectors).find(s => s.name === txSector);
     const expectsSub = chosenSectorObj && chosenSectorObj.subCategories && chosenSectorObj.subCategories.length > 0;
 
     const payload = {
-      id: targetId,
       date: txDate,
       sector: txSector,
       subCategory: expectsSub ? txSubCategory : '',
@@ -345,6 +403,9 @@ export default function App() {
       note: txNote.trim(),
       deleted: false
     };
+
+    const targetId = txId || createExpenseId(payload);
+    payload.id = targetId;
 
     saveRecordLocallyAndCloud('expenses', targetId, payload);
     
