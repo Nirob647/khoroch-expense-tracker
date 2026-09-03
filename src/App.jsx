@@ -10,9 +10,9 @@ import {
 import { 
   getFirestore, 
   doc, 
+  setDoc,
   onSnapshot, 
-  collection,
-  runTransaction
+  collection
 } from 'firebase/firestore';
 
 // Safely try to fetch from local environment variables or platform sandbox injection
@@ -44,37 +44,6 @@ const LOCAL_STORAGE_KEYS = {
 };
 
 const getRecordTime = (record) => Number(record?.updatedAt) || 0;
-const getCreatedTime = (record) => Number(record?.createdAt) || getRecordTime(record);
-
-const shouldUseLocalRecord = (localRecord, cloudRecord) => {
-  const localCreatedAt = getCreatedTime(localRecord);
-  const cloudCreatedAt = getCreatedTime(cloudRecord);
-
-  // Matching creation times are later changes to the same entry; keep the latest change.
-  if (localCreatedAt === cloudCreatedAt) {
-    return getRecordTime(localRecord) > getRecordTime(cloudRecord);
-  }
-
-  // Different creation times are duplicate entries from separate devices; keep the first one.
-  return localCreatedAt < cloudCreatedAt;
-};
-
-const shouldUseCloudRecord = (cloudRecord, localRecord) => {
-  if (!localRecord) return true;
-  if (getCreatedTime(cloudRecord) !== getCreatedTime(localRecord)) {
-    return getCreatedTime(cloudRecord) < getCreatedTime(localRecord);
-  }
-  return getRecordTime(cloudRecord) > getRecordTime(localRecord);
-};
-
-const createExpenseId = ({ date, sector, subCategory, amount, note }) => {
-  const fingerprint = `${date}|${sector}|${subCategory}|${amount}|${note}`;
-  let hash = 0;
-  for (let index = 0; index < fingerprint.length; index += 1) {
-    hash = ((hash << 5) - hash + fingerprint.charCodeAt(index)) | 0;
-  }
-  return `tx_${(hash >>> 0).toString(36)}`;
-};
 
 const DEFAULT_SECTORS = [
   { id: 'sec-food', name: 'Food', subCategories: ['Breakfast', 'Lunch', 'Dinner'], custom: false, updatedAt: 1 },
@@ -241,19 +210,10 @@ export default function App() {
     else if (collectionName === 'budgets') setBudgets(records);
   };
 
-  // A transaction makes conflict resolution consistent when multiple devices reconnect together.
-  // Duplicate entries keep the first save, while edits and deletes keep the latest change.
   const syncRecord = async (collectionName, id, localItem) => {
     const itemRef = doc(db, 'artifacts', appId, 'users', user.uid, collectionName, id);
-
-    return runTransaction(db, async (transaction) => {
-      const cloudSnapshot = await transaction.get(itemRef);
-      if (!cloudSnapshot.exists() || shouldUseLocalRecord(localItem, cloudSnapshot.data())) {
-        transaction.set(itemRef, localItem);
-        return localItem;
-      }
-      return cloudSnapshot.data();
-    });
+    await setDoc(itemRef, localItem);
+    return localItem;
   };
 
   const syncLocalRecords = async () => {
@@ -291,7 +251,7 @@ export default function App() {
           const cloudItem = doc.data();
           const localItem = prevExpenses[doc.id];
           
-          if (shouldUseCloudRecord(cloudItem, localItem)) {
+          if (!localItem || getRecordTime(cloudItem) > getRecordTime(localItem)) {
             updated[doc.id] = cloudItem;
             hasChanges = true;
           }
@@ -320,7 +280,7 @@ export default function App() {
           const cloudItem = doc.data();
           const localItem = prevSectors[doc.id];
 
-          if (shouldUseCloudRecord(cloudItem, localItem)) {
+          if (!localItem || getRecordTime(cloudItem) > getRecordTime(localItem)) {
             updated[doc.id] = cloudItem;
             hasChanges = true;
           }
@@ -345,7 +305,7 @@ export default function App() {
           const cloudItem = doc.data();
           const localItem = prevBudgets[doc.id];
 
-          if (shouldUseCloudRecord(cloudItem, localItem)) {
+          if (!localItem || getRecordTime(cloudItem) > getRecordTime(localItem)) {
             updated[doc.id] = cloudItem;
             hasChanges = true;
           }
@@ -375,11 +335,7 @@ export default function App() {
 
   const saveRecordLocallyAndCloud = async (collectionName, id, data) => {
     const timestamp = Math.max(Date.now(), getRecordTime(data) + 1);
-    const timestampedData = {
-      ...data,
-      createdAt: data.createdAt || data.updatedAt || timestamp,
-      updatedAt: timestamp
-    };
+    const timestampedData = { ...data, updatedAt: timestamp };
 
     // Zero Loading Latency updates on local instance
     if (collectionName === 'expenses') {
@@ -421,21 +377,16 @@ export default function App() {
 
     const chosenSectorObj = Object.values(sectors).find(s => s.name === txSector);
     const expectsSub = chosenSectorObj && chosenSectorObj.subCategories && chosenSectorObj.subCategories.length > 0;
-    const existingExpense = txId ? expenses[txId] : null;
-
     const payload = {
       date: txDate,
       sector: txSector,
       subCategory: expectsSub ? txSubCategory : '',
       amount: Math.round(parseInt(txAmount)),
       note: txNote.trim(),
-      deleted: false,
-      ...(existingExpense && {
-        createdAt: existingExpense.createdAt || existingExpense.updatedAt
-      })
+      deleted: false
     };
 
-    const targetId = txId || createExpenseId(payload);
+    const targetId = txId || 'tx_' + Math.random().toString(36).substring(2, 15);
     payload.id = targetId;
 
     saveRecordLocallyAndCloud('expenses', targetId, payload);
