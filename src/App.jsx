@@ -80,6 +80,7 @@ export default function App() {
   // Navigation
   const [currentDate, setCurrentDate] = useState(new Date());
   const [comparisonPeriod, setComparisonPeriod] = useState('month');
+  const [activeTab, setActiveTab] = useState('home');
   
   // Modals & UI Toggles
   const [isAddExpenseOpen, setIsAddExpenseOpen] = useState(false);
@@ -371,6 +372,12 @@ export default function App() {
     }
   };
 
+  const shiftTxDate = (offset) => {
+    const date = new Date(`${txDate}T00:00:00`);
+    date.setDate(date.getDate() + offset);
+    setTxDate(`${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`);
+  };
+
   const handleSaveExpense = (e) => {
     e.preventDefault();
     if (!txAmount || isNaN(txAmount) || parseInt(txAmount) <= 0) return;
@@ -640,6 +647,25 @@ export default function App() {
     return activeBudgetsCalculated.filter(b => b.overspent > 0);
   }, [activeBudgetsCalculated]);
 
+  const budgetSectorOverview = useMemo(() => {
+    return activeSectorsList.map((sector) => {
+      const spent = sectorBreakdowns.find((entry) => entry.name === sector.name)?.total || 0;
+      const budget = activeBudgetsCalculated.find((entry) => entry.scope === sector.name && entry.type === 'monthly');
+      const limit = budget?.limit || 0;
+      const progress = limit > 0 ? Math.min(Math.round((spent / limit) * 100), 100) : 0;
+      const level = !limit ? 'No budget set' : spent > limit ? 'Over budget' : progress >= 80 ? 'Close to limit' : 'On track';
+
+      return { ...sector, spent, limit, progress, level };
+    });
+  }, [activeSectorsList, sectorBreakdowns, activeBudgetsCalculated]);
+
+  const homeBudgetSummary = useMemo(() => {
+    const totalLimit = activeBudgetsCalculated.reduce((sum, budget) => sum + budget.limit, 0);
+    const totalSpent = activeBudgetsCalculated.reduce((sum, budget) => sum + budget.spent, 0);
+    const progress = totalLimit ? Math.min(Math.round((totalSpent / totalLimit) * 100), 100) : 0;
+    return { totalLimit, totalSpent, progress, budgets: activeBudgetsCalculated.slice(0, 3) };
+  }, [activeBudgetsCalculated]);
+
   const comparisonStats = useMemo(() => {
     const todayStr = getTodayDateString();
     const today = new Date();
@@ -797,7 +823,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col antialiased selection:bg-emerald-500 selection:text-slate-950 font-sans pb-10">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col antialiased selection:bg-emerald-500 selection:text-slate-950 font-sans pb-24">
       
       {/* Header element */}
       <header className="sticky top-0 z-40 bg-slate-950/95 backdrop-blur-md border-b border-slate-900">
@@ -843,7 +869,8 @@ export default function App() {
 
       {/* Main Content Dashboard */}
       <main className="flex-1 max-w-6xl w-full mx-auto px-4 py-6 space-y-6">
-        
+        {activeTab === 'home' && (
+          <>
         {activeAlerts.length > 0 && (
           <div className="space-y-2">
             {activeAlerts.map(alert => (
@@ -873,9 +900,11 @@ export default function App() {
           </div>
         )}
 
-        <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <section className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           
-          <div className="bg-slate-900 border border-slate-850 p-5 rounded-2xl flex flex-col justify-between space-y-3">
+          <div className="relative overflow-hidden rounded-2xl border border-emerald-800/70 bg-gradient-to-br from-emerald-950 via-slate-900 to-teal-950 p-5 shadow-xl shadow-emerald-950/25">
+            <div className="absolute -right-10 -top-12 h-32 w-32 rounded-full bg-emerald-400/20 blur-2xl" />
+            <div className="relative flex h-full flex-col justify-between space-y-3">
             <div className="flex items-center justify-between">
               <span className="text-xs text-slate-500 font-bold uppercase tracking-wider">Total Monthly Spent</span>
               <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 px-2.5 py-1 rounded-lg">
@@ -903,62 +932,10 @@ export default function App() {
                 Accrued across <span className="font-bold text-slate-300">{activeMonthExpenses.length}</span> individual logs
               </p>
             </div>
-          </div>
-
-          <div className="bg-slate-900 border border-slate-850 p-5 rounded-2xl flex flex-col justify-between space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-slate-500 font-bold uppercase tracking-wider">Comparative Insights</span>
-              <div className="flex bg-slate-950 rounded-lg p-0.5 border border-slate-850 text-xs">
-                {['day', 'week', 'month'].map(period => (
-                  <button
-                    key={period}
-                    onClick={() => setComparisonPeriod(period)}
-                    className={`px-2.5 py-1 rounded-md font-semibold capitalize transition ${
-                      comparisonPeriod === period 
-                        ? 'bg-emerald-600 text-slate-950 shadow-md' 
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {period}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div>
-              <div className="flex items-baseline gap-2">
-                <span className="text-2xl font-bold font-mono text-slate-100">
-                  {formatCurrency(comparisonStats.currentVal)}
-                </span>
-                <span className="text-xs text-slate-500">vs {formatCurrency(comparisonStats.prevVal)}</span>
-              </div>
-              
-              <div className="flex items-center gap-1.5 mt-2">
-                {comparisonStats.diffPercent > 0 ? (
-                  <span className="text-xs font-bold px-2 py-0.5 rounded bg-rose-950/60 border border-rose-900/60 text-rose-400 flex items-center gap-0.5">
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 10l7-7m0 0l7 7m-7-7v18" />
-                    </svg>
-                    {comparisonStats.diffPercent}% more
-                  </span>
-                ) : comparisonStats.diffPercent < 0 ? (
-                  <span className="text-xs font-bold px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-900/60 text-emerald-400 flex items-center gap-0.5">
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M19 14l-7 7m0 0l-7-7m7 7V3" />
-                    </svg>
-                    {Math.abs(comparisonStats.diffPercent)}% less
-                  </span>
-                ) : (
-                  <span className="text-xs font-bold px-2 py-0.5 rounded bg-slate-800 text-slate-400">
-                    Equal level
-                  </span>
-                )}
-                <span className="text-xs text-slate-500 font-medium">than {comparisonStats.prevLabel}</span>
-              </div>
             </div>
           </div>
 
-          <div className="bg-slate-900 border border-slate-850 p-5 rounded-2xl flex flex-col justify-center space-y-3">
+          <div className="rounded-2xl border border-violet-800/60 bg-gradient-to-br from-violet-950 via-slate-900 to-slate-900 p-5 shadow-xl shadow-violet-950/25">
             <button
               onClick={() => {
                 setTxId(null);
@@ -991,11 +968,12 @@ export default function App() {
           </div>
         </section>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
+        <div className="grid grid-cols-1 gap-6 items-start">
           
-          <div className="lg:col-span-1 space-y-6">
+          <div className="space-y-6">
             
-            <div className="bg-slate-900 border border-slate-850 p-5 rounded-2xl space-y-4">
+            <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 p-5 shadow-xl shadow-slate-950/30">
+              <div className="absolute right-0 top-0 h-24 w-24 rounded-full bg-cyan-500/10 blur-2xl" />
               <div className="flex items-center justify-between">
                 <h3 className="font-bold text-sm tracking-wide text-slate-400 uppercase">Active Budgets</h3>
                 <span className="text-xs text-slate-500 font-semibold">Total: {activeBudgetsCalculated.length}</span>
@@ -1096,9 +1074,80 @@ export default function App() {
                 </div>
               )}
             </div>
+
+            <section className="relative overflow-hidden rounded-3xl border border-indigo-800/60 bg-gradient-to-br from-indigo-950 via-slate-900 to-emerald-950 p-5 shadow-2xl shadow-indigo-950/30">
+              <div className="absolute -right-12 -top-16 h-48 w-48 rounded-full bg-fuchsia-500/20 blur-3xl" />
+              <div className="absolute -bottom-20 left-1/3 h-44 w-44 rounded-full bg-cyan-400/10 blur-3xl" />
+              <div className="relative">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-[11px] font-black uppercase tracking-[0.2em] text-indigo-300">Budget at a glance</p>
+                    <h3 className="mt-1 text-xl font-extrabold text-white">Your money map</h3>
+                    <p className="mt-1 text-xs text-slate-300">A quick view of spending against your active plans.</p>
+                  </div>
+                  <button onClick={() => setIsAddBudgetOpen(true)} className="rounded-xl bg-white/10 px-3 py-2 text-xs font-extrabold text-white ring-1 ring-white/15 transition hover:bg-white/20">
+                    + Budget
+                  </button>
+                </div>
+
+                {homeBudgetSummary.totalLimit > 0 ? (
+                  <div className="mt-5 grid grid-cols-[112px_1fr] items-center gap-4 sm:grid-cols-[132px_1fr]">
+                    <div className="relative mx-auto flex h-28 w-28 items-center justify-center rounded-full p-2 sm:h-32 sm:w-32" style={{ background: `conic-gradient(${activeAlerts.length ? '#fb7185' : '#34d399'} ${homeBudgetSummary.progress}%, rgba(255,255,255,0.12) 0)` }}>
+                      <div className="flex h-full w-full flex-col items-center justify-center rounded-full bg-slate-950/95 text-center">
+                        <span className="font-mono text-2xl font-black text-white">{homeBudgetSummary.progress}%</span>
+                        <span className="mt-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">used</span>
+                      </div>
+                    </div>
+                    <div className="space-y-3">
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="rounded-2xl bg-white/10 p-3 ring-1 ring-white/10">
+                          <p className="text-[10px] font-bold uppercase tracking-wider text-indigo-200">Spent</p>
+                          <p className="mt-1 font-mono text-sm font-extrabold text-white">{formatCurrency(homeBudgetSummary.totalSpent)}</p>
+                        </div>
+                        <div className="rounded-2xl bg-white/10 p-3 ring-1 ring-white/10">
+                          <p className="text-[10px] font-bold uppercase tracking-wider text-indigo-200">Budget</p>
+                          <p className="mt-1 font-mono text-sm font-extrabold text-white">{formatCurrency(homeBudgetSummary.totalLimit)}</p>
+                        </div>
+                      </div>
+                      <p className={`text-xs font-bold ${activeAlerts.length ? 'text-rose-300' : 'text-emerald-300'}`}>
+                        {activeAlerts.length ? `${activeAlerts.length} budget${activeAlerts.length === 1 ? '' : 's'} need attention` : 'Looking good — your plans are on track.'}
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-5 rounded-2xl bg-white/10 p-5 text-center ring-1 ring-white/10">
+                    <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-fuchsia-400 to-indigo-500 text-xl font-black text-white">৳</div>
+                    <p className="mt-3 text-sm font-extrabold text-white">Give your spending a target</p>
+                    <p className="mt-1 text-xs text-slate-300">Create a budget to see your visual money map here.</p>
+                  </div>
+                )}
+
+                {homeBudgetSummary.budgets.length > 0 && (
+                  <div className="mt-5 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    {homeBudgetSummary.budgets.map((budget, index) => {
+                      const palette = [
+                        'from-cyan-500/25 to-blue-600/20 text-cyan-200',
+                        'from-fuchsia-500/25 to-purple-600/20 text-fuchsia-200',
+                        'from-amber-400/25 to-orange-600/20 text-amber-100'
+                      ][index];
+                      return (
+                        <div key={budget.id} className={`rounded-2xl bg-gradient-to-br ${palette} p-3 ring-1 ring-white/10`}>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="truncate text-xs font-extrabold">{budget.scope === 'all' ? 'All sectors' : budget.scope}</span>
+                            <span className="text-[10px] font-bold">{Math.round(budget.progress)}%</span>
+                          </div>
+                          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-950/30"><div className="h-full rounded-full bg-white" style={{ width: `${budget.progress}%` }} /></div>
+                          <p className="mt-2 text-[11px] font-semibold text-white/85">{formatCurrency(budget.spent)} of {formatCurrency(budget.limit)}</p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </section>
           </div>
 
-          <div className="lg:col-span-2 space-y-6">
+          <div className="space-y-6">
             <div className="bg-slate-900 border border-slate-850 p-5 rounded-2xl space-y-4">
               <div className="flex items-center justify-between">
                 <div>
@@ -1180,7 +1229,133 @@ export default function App() {
           </div>
 
         </div>
+          </>
+        )}
+
+        {activeTab === 'budget' && (
+          <section className="space-y-5 animate-fadeIn">
+            <div className="flex items-end justify-between gap-4">
+              <div>
+                <p className="text-xs font-bold uppercase tracking-[0.18em] text-emerald-500">Monthly view</p>
+                <h2 className="mt-1 text-2xl font-extrabold tracking-tight text-slate-100">Your budget pulse</h2>
+                <p className="mt-1 text-sm text-slate-500">See every sector at a glance, including the ones you have not spent from yet.</p>
+              </div>
+              <button
+                onClick={() => setIsAddBudgetOpen(true)}
+                className="shrink-0 rounded-xl bg-emerald-500 px-3 py-2 text-xs font-extrabold text-slate-950 shadow-lg shadow-emerald-950/30 transition hover:bg-emerald-400"
+              >
+                + Set budget
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <div className="col-span-2 rounded-2xl border border-emerald-800/50 bg-gradient-to-br from-emerald-950/70 to-slate-900 p-4 sm:col-span-1">
+                <p className="text-[11px] font-bold uppercase tracking-wider text-emerald-400/80">Spent this month</p>
+                <p className="mt-2 font-mono text-2xl font-extrabold text-emerald-400">{formatCurrency(activeMonthTotal)}</p>
+                <p className="mt-1 text-xs text-slate-400">Across {activeMonthExpenses.length} entries</p>
+              </div>
+              <div className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+                <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Budgets</p>
+                <p className="mt-2 font-mono text-2xl font-extrabold text-slate-100">{activeBudgetsCalculated.length}</p>
+                <p className="mt-1 text-xs text-slate-500">Active plans</p>
+              </div>
+              <div className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+                <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Watch list</p>
+                <p className="mt-2 font-mono text-2xl font-extrabold text-rose-400">{activeAlerts.length}</p>
+                <p className="mt-1 text-xs text-slate-500">Over budget</p>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-850 bg-slate-900 p-4 sm:p-5">
+              <div className="mb-4 flex items-center justify-between">
+                <div>
+                  <h3 className="font-bold text-slate-100">Sector levels</h3>
+                  <p className="text-xs text-slate-500">Budget, spent amount, and current level.</p>
+                </div>
+                <span className="rounded-full border border-slate-800 bg-slate-950 px-2.5 py-1 text-[10px] font-bold text-slate-500">{budgetSectorOverview.length} sectors</span>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {budgetSectorOverview.map((sector) => {
+                  const isOver = sector.limit > 0 && sector.spent > sector.limit;
+                  const isNearLimit = sector.limit > 0 && sector.progress >= 80 && !isOver;
+                  const tone = isOver ? 'rose' : isNearLimit ? 'amber' : 'emerald';
+                  const toneClasses = {
+                    emerald: 'bg-emerald-500 text-emerald-400 border-emerald-900/60',
+                    amber: 'bg-amber-400 text-amber-400 border-amber-900/60',
+                    rose: 'bg-rose-500 text-rose-400 border-rose-900/60'
+                  }[tone];
+
+                  return (
+                    <div key={sector.id} className="rounded-xl border border-slate-800 bg-slate-950/70 p-4 transition hover:border-slate-700">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <p className="font-bold text-slate-200">{sector.name}</p>
+                          <p className={`mt-1 inline-flex rounded-full border px-2 py-0.5 text-[10px] font-bold ${toneClasses.split(' ').slice(2).join(' ')} ${toneClasses.split(' ')[1]}`}>{sector.level}</p>
+                        </div>
+                        <span className="font-mono text-sm font-extrabold text-emerald-400">{formatCurrency(sector.spent)}</span>
+                      </div>
+                      <div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-800">
+                        <div className={`h-full rounded-full ${toneClasses.split(' ')[0]}`} style={{ width: `${sector.progress}%` }} />
+                      </div>
+                      <div className="mt-2 flex justify-between text-[11px]">
+                        <span className="text-slate-500">Spent {formatCurrency(sector.spent)}</span>
+                        <span className="font-semibold text-slate-400">{sector.limit ? `Budget ${formatCurrency(sector.limit)}` : 'No limit'}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {activeTab === 'habit' && (
+          <section className="flex min-h-[56vh] items-center justify-center animate-fadeIn">
+            <div className="max-w-sm rounded-3xl border border-slate-800 bg-slate-900 p-8 text-center shadow-xl shadow-slate-950/30">
+              <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-emerald-950 text-2xl">✓</div>
+              <h2 className="mt-5 text-xl font-extrabold">Habit Track is coming soon</h2>
+              <p className="mt-2 text-sm leading-6 text-slate-500">A focused place to build routines alongside your spending habits.</p>
+            </div>
+          </section>
+        )}
+
+        {activeTab === 'profile' && (
+          <section className="mx-auto max-w-md animate-fadeIn">
+            <div className="rounded-3xl border border-slate-800 bg-slate-900 p-6 shadow-xl shadow-slate-950/30">
+              <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-500 to-emerald-700 text-2xl font-extrabold text-slate-950">
+                {(user.displayName || user.email || 'K').trim().charAt(0).toUpperCase()}
+              </div>
+              <p className="mt-5 text-xs font-bold uppercase tracking-[0.18em] text-emerald-500">Profile</p>
+              <h2 className="mt-1 text-2xl font-extrabold text-slate-100">{user.displayName || user.email?.split('@')[0] || 'Khoroch user'}</h2>
+              <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-950 p-4">
+                <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Email</p>
+                <p className="mt-1 break-all text-sm font-semibold text-slate-200">{user.email || 'Not available'}</p>
+              </div>
+            </div>
+          </section>
+        )}
       </main>
+
+      <nav className="fixed inset-x-0 bottom-0 z-40 mx-auto flex max-w-md items-center justify-around border border-slate-800/90 bg-slate-900/95 px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] pt-2 shadow-[0_-12px_30px_rgba(2,6,23,0.45)] backdrop-blur-lg">
+        {[
+          { id: 'home', label: 'Home', icon: <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1V10.5Z" /> },
+          { id: 'budget', label: 'Budget', icon: <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 19V9m5 10V5m5 14v-7m5 7V3" /> },
+          { id: 'habit', label: 'Habit Track', icon: <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-5m5 3a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z" /> },
+          { id: 'profile', label: 'Profile', icon: <><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 20v-1a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v1" /><circle cx="9.5" cy="7" r="4" strokeWidth="2" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 8v6m3-3h-6" /></> }
+        ].map((item) => (
+          <button
+            key={item.id}
+            onClick={() => setActiveTab(item.id)}
+            className={`flex min-w-[64px] flex-col items-center gap-1 rounded-xl px-3 py-1.5 text-[10px] font-bold transition ${
+              activeTab === item.id ? 'bg-emerald-500 text-slate-950 shadow-lg shadow-emerald-950/30' : 'text-slate-500 hover:text-slate-200'
+            }`}
+          >
+            <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">{item.icon}</svg>
+            <span>{item.label}</span>
+          </button>
+        ))}
+      </nav>
 
       {/* MODALS AREA */}
 
@@ -1204,13 +1379,32 @@ export default function App() {
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1">
                   <label className="text-xs font-bold text-slate-400">Date</label>
-                  <input
-                    type="date"
-                    required
-                    value={txDate}
-                    onChange={(e) => setTxDate(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500"
-                  />
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => shiftTxDate(-1)}
+                      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-800 bg-slate-950 text-slate-400 transition hover:border-emerald-800 hover:text-emerald-400"
+                      title="Previous day"
+                    >
+                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="m15 18-6-6 6-6" /></svg>
+                    </button>
+                    <input
+                      type="date"
+                      required
+                      value={txDate}
+                      onChange={(e) => setTxDate(e.target.value)}
+                      className="min-w-0 flex-1 bg-slate-950 border border-slate-800 rounded-lg px-2 py-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => shiftTxDate(1)}
+                      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-800 bg-slate-950 text-slate-400 transition hover:border-emerald-800 hover:text-emerald-400"
+                      title="Next day"
+                    >
+                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="m9 6 6 6-6 6" /></svg>
+                    </button>
+                  </div>
+                  <button type="button" onClick={() => setTxDate(getTodayDateString())} className="mt-1 text-[10px] font-bold text-emerald-500 hover:text-emerald-400">Jump to today</button>
                 </div>
                 <div className="space-y-1">
                   <label className="text-xs font-bold text-slate-400">Amount (৳)</label>
