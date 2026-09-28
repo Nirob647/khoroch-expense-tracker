@@ -107,6 +107,16 @@ export default function App() {
 
   const [copiedText, setCopiedText] = useState(null);
 
+  // Bug-fix additions
+  const [dismissedAlertIds, setDismissedAlertIds] = useState(() => new Set());
+  const [editingBudgetId, setEditingBudgetId] = useState(null);
+  const [budgetFormError, setBudgetFormError] = useState('');
+  const [authTimedOut, setAuthTimedOut] = useState(false);
+  const [offlineMode, setOfflineMode] = useState(false);
+  const [pendingWriteCount, setPendingWriteCount] = useState(0);
+  const [logSectorFilter, setLogSectorFilter] = useState('all');
+  const [sectorDetailName, setSectorDetailName] = useState(null);
+
   useEffect(() => {
     const handleOnline = () => {
       setIsOnline(true);
@@ -149,12 +159,47 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const timeoutId = setTimeout(() => {
+      setAuthTimedOut((wasTimedOut) => wasTimedOut || true);
+    }, 8000);
+
     const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      clearTimeout(timeoutId);
+      setAuthTimedOut(false);
+      if (firebaseUser) {
+        try {
+          localStorage.setItem('exp_v2_last_user', JSON.stringify({
+            uid: firebaseUser.uid,
+            email: firebaseUser.email,
+            displayName: firebaseUser.displayName
+          }));
+        } catch (e) { /* ignore cache failure */ }
+      }
       setUser(firebaseUser || null);
       setAuthChecked(true);
+      setOfflineMode(false);
     });
-    return () => unsubscribe();
+    return () => {
+      clearTimeout(timeoutId);
+      unsubscribe();
+    };
   }, []);
+
+  const handleUseOffline = () => {
+    let cachedUser = null;
+    try {
+      cachedUser = JSON.parse(localStorage.getItem('exp_v2_last_user') || 'null');
+    } catch (e) { /* ignore */ }
+
+    setUser(cachedUser || { uid: null, email: null, displayName: 'Offline User' });
+    setOfflineMode(true);
+    setAuthChecked(true);
+    setAuthTimedOut(false);
+  };
+
+  const handleRetryConnection = () => {
+    window.location.reload();
+  };
 
   const handleSignup = async (e) => {
     e.preventDefault();
@@ -321,7 +366,10 @@ export default function App() {
     }, () => {});
 
     syncLocalRecords()
-      .then(() => setSyncStatus('synced'))
+      .then(() => {
+        setSyncStatus('synced');
+        setPendingWriteCount(0);
+      })
       .catch((error) => {
         console.warn('Unable to sync locally saved records after reconnecting', error);
         setSyncStatus('offline');
@@ -354,8 +402,9 @@ export default function App() {
     }
 
     // Dynamic background replication to connected Firestore instances
-    if (isOnline && user && !!firebaseConfig.apiKey) {
+    if (isOnline && user?.uid && !!firebaseConfig.apiKey) {
       setSyncStatus('pending');
+      setPendingWriteCount((n) => n + 1);
       try {
         const savedRecord = await syncRecord(collectionName, id, timestampedData);
         if (savedRecord !== timestampedData) {
@@ -366,9 +415,12 @@ export default function App() {
       } catch (err) {
         console.warn("Background persistence failed, holding local copy", err);
         setSyncStatus('offline');
+      } finally {
+        setPendingWriteCount((n) => Math.max(0, n - 1));
       }
     } else {
       setSyncStatus('offline');
+      setPendingWriteCount((n) => n + 1);
     }
   };
 
@@ -482,25 +534,80 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  const openBudgetForm = (budget = null) => {
+    setBudgetFormError('');
+    if (budget) {
+      setEditingBudgetId(budget.id);
+      setBudgetType(budget.type);
+      setBudgetLimit(String(budget.limit));
+      setBudgetScope(budget.scope);
+      setBudgetDays(budget.days || 5);
+    } else {
+      setEditingBudgetId(null);
+      setBudgetType('monthly');
+      setBudgetLimit('');
+      setBudgetScope('all');
+      setBudgetDays(5);
+    }
+    setIsAddBudgetOpen(true);
+  };
+
+  const closeBudgetForm = () => {
+    setIsAddBudgetOpen(false);
+    setEditingBudgetId(null);
+    setBudgetFormError('');
+    setBudgetLimit('');
+    setBudgetScope('all');
+  };
+
   const handleSaveBudget = (e) => {
     e.preventDefault();
-    if (!budgetLimit || isNaN(budgetLimit) || parseInt(budgetLimit) <= 0) return;
+    setBudgetFormError('');
+    if (!budgetLimit || isNaN(budgetLimit) || parseInt(budgetLimit) <= 0) {
+      setBudgetFormError('Enter a valid budget amount.');
+      return;
+    }
+    const newLimit = Math.round(parseInt(budgetLimit));
+    const liveBudgets = Object.values(budgets).filter(b => !b.deleted && b.id !== editingBudgetId);
 
-    const targetId = 'bud_' + Math.random().toString(36).substring(2, 15);
+    // Central ("all sectors") budget acts as an overall cap for same-type sector budgets
+    if (budgetScope !== 'all') {
+      const central = liveBudgets.find(b => b.scope === 'all' && b.type === budgetType);
+      if (central) {
+        const sectorSum = liveBudgets
+          .filter(b => b.scope !== 'all' && b.type === budgetType)
+          .reduce((sum, b) => sum + b.limit, 0);
+        if (sectorSum + newLimit > central.limit) {
+          const room = Math.max(0, central.limit - sectorSum);
+          setBudgetFormError(`Sector budgets can't exceed your central ${budgetType} budget of ${formatCurrency(central.limit)}. You have ${formatCurrency(room)} left to allocate.`);
+          return;
+        }
+      }
+    } else {
+      const sectorSum = liveBudgets
+        .filter(b => b.scope !== 'all' && b.type === budgetType)
+        .reduce((sum, b) => sum + b.limit, 0);
+      if (sectorSum > newLimit) {
+        setBudgetFormError(`Central budget can't be lower than your existing sector budgets total (${formatCurrency(sectorSum)}).`);
+        return;
+      }
+    }
+
+    const targetId = editingBudgetId || 'bud_' + Math.random().toString(36).substring(2, 15);
+    const existing = editingBudgetId ? budgets[editingBudgetId] : null;
     const payload = {
+      ...(existing || {}),
       id: targetId,
       type: budgetType,
-      limit: Math.round(parseInt(budgetLimit)),
+      limit: newLimit,
       scope: budgetScope,
       days: budgetType === 'next-n-days' ? parseInt(budgetDays) : null,
-      startDate: budgetType === 'next-n-days' ? getTodayDateString() : null,
+      startDate: budgetType === 'next-n-days' ? (existing?.startDate || getTodayDateString()) : null,
       deleted: false
     };
 
     saveRecordLocallyAndCloud('budgets', targetId, payload);
-    setBudgetLimit('');
-    setBudgetScope('all');
-    setIsAddBudgetOpen(false);
+    closeBudgetForm();
   };
 
   const handleDeleteBudget = (id) => {
@@ -660,11 +767,30 @@ export default function App() {
   }, [activeSectorsList, sectorBreakdowns, activeBudgetsCalculated]);
 
   const homeBudgetSummary = useMemo(() => {
-    const totalLimit = activeBudgetsCalculated.reduce((sum, budget) => sum + budget.limit, 0);
-    const totalSpent = activeBudgetsCalculated.reduce((sum, budget) => sum + budget.spent, 0);
+    const centralBudgets = activeBudgetsCalculated.filter(budget => budget.scope === 'all');
+    const basis = centralBudgets.length > 0 ? centralBudgets : activeBudgetsCalculated;
+    const totalLimit = basis.reduce((sum, budget) => sum + budget.limit, 0);
+    const totalSpent = basis.reduce((sum, budget) => sum + budget.spent, 0);
     const progress = totalLimit ? Math.min(Math.round((totalSpent / totalLimit) * 100), 100) : 0;
-    return { totalLimit, totalSpent, progress, budgets: activeBudgetsCalculated.slice(0, 3) };
+    const tiles = activeBudgetsCalculated.filter(budget => budget.scope !== 'all');
+    return { totalLimit, totalSpent, progress, budgets: (tiles.length > 0 ? tiles : activeBudgetsCalculated).slice(0, 3) };
   }, [activeBudgetsCalculated]);
+
+  const monthLabelForDetail = currentDate.toLocaleDateString('default', { month: 'short', year: 'numeric' });
+
+  const filteredLogs = useMemo(() => {
+    return logSectorFilter === 'all'
+      ? activeMonthExpenses
+      : activeMonthExpenses.filter(item => item.sector === logSectorFilter);
+  }, [activeMonthExpenses, logSectorFilter]);
+
+  const sectorDetail = useMemo(() => {
+    if (!sectorDetailName) return null;
+    const logs = activeMonthExpenses.filter(item => item.sector === sectorDetailName);
+    const spent = logs.reduce((sum, item) => sum + item.amount, 0);
+    const budgetsForSector = activeBudgetsCalculated.filter(b => b.scope === sectorDetailName);
+    return { name: sectorDetailName, logs, spent, budgets: budgetsForSector };
+  }, [sectorDetailName, activeMonthExpenses, activeBudgetsCalculated]);
 
   const comparisonStats = useMemo(() => {
     const todayStr = getTodayDateString();
@@ -772,6 +898,21 @@ export default function App() {
   };
 
   if (!authChecked) {
+    if (authTimedOut) {
+      return (
+        <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
+          <div className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4 text-center">
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-950/60 text-amber-400 text-xl">!</div>
+            <h2 className="text-lg font-extrabold text-slate-100">Can't reach the server</h2>
+            <p className="text-sm text-slate-400">We couldn't connect after a while. Check your connection, or keep using Khoroch with your locally saved data until it's back.</p>
+            <div className="flex flex-col gap-2 pt-2">
+              <button onClick={handleRetryConnection} className="w-full rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold py-2.5 text-sm transition">Retry</button>
+              <button onClick={handleUseOffline} className="w-full rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-2.5 text-sm transition">Use Offline</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center">
         <p className="text-slate-500 text-sm">Loading...</p>
@@ -840,17 +981,23 @@ export default function App() {
 
           <div className="flex items-center gap-2">
             <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border ${
-              syncStatus === 'synced' && !!firebaseConfig.apiKey
+              syncStatus === 'synced' && !!firebaseConfig.apiKey && pendingWriteCount === 0
                 ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-400' 
-                : syncStatus === 'pending'
+                : syncStatus === 'pending' || pendingWriteCount > 0
                 ? 'bg-yellow-950/40 border-yellow-800/60 text-yellow-400 animate-pulse'
                 : 'bg-slate-900/60 border-slate-800/80 text-slate-400'
             }`}>
               <span className={`w-2 h-2 rounded-full ${
-                syncStatus === 'synced' && !!firebaseConfig.apiKey ? 'bg-emerald-400' : syncStatus === 'pending' ? 'bg-yellow-400' : 'bg-slate-600'
+                syncStatus === 'synced' && !!firebaseConfig.apiKey && pendingWriteCount === 0 ? 'bg-emerald-400' : syncStatus === 'pending' || pendingWriteCount > 0 ? 'bg-yellow-400' : 'bg-slate-600'
               }`} />
-              <span className="hidden xs:inline capitalize">
-                {syncStatus === 'synced' && !!firebaseConfig.apiKey ? 'Synced' : syncStatus === 'pending' ? 'Syncing...' : 'Local Engine Only'}
+              <span className="hidden xs:inline">
+                {pendingWriteCount > 0
+                  ? `${pendingWriteCount} unsynced change${pendingWriteCount === 1 ? '' : 's'}`
+                  : syncStatus === 'synced' && !!firebaseConfig.apiKey
+                  ? 'All synced'
+                  : offlineMode
+                  ? 'Working offline'
+                  : 'Local Engine Only'}
               </span>
             </div>
 
@@ -871,9 +1018,9 @@ export default function App() {
       <main className="flex-1 max-w-6xl w-full mx-auto px-4 py-6 space-y-6">
         {activeTab === 'home' && (
           <>
-        {activeAlerts.length > 0 && (
+        {activeAlerts.filter(a => !dismissedAlertIds.has(a.id)).length > 0 && (
           <div className="space-y-2">
-            {activeAlerts.map(alert => (
+            {activeAlerts.filter(a => !dismissedAlertIds.has(a.id)).map(alert => (
               <div 
                 key={alert.id}
                 className="bg-rose-950/30 border border-rose-900/50 rounded-xl p-4 flex items-start gap-3 text-rose-200 animate-fadeIn"
@@ -890,7 +1037,7 @@ export default function App() {
                   </p>
                 </div>
                 <button 
-                  onClick={() => handleDeleteBudget(alert.id)}
+                  onClick={() => setDismissedAlertIds(prev => new Set(prev).add(alert.id))}
                   className="text-rose-400 hover:text-rose-200 text-xs font-semibold hover:underline"
                 >
                   Dismiss
@@ -959,7 +1106,7 @@ export default function App() {
                 + Custom Sector
               </button>
               <button
-                onClick={() => setIsAddBudgetOpen(true)}
+                onClick={() => openBudgetForm()}
                 className="py-2 px-3 rounded-lg bg-slate-950 hover:bg-slate-900 border border-slate-850 text-xs font-bold text-slate-300 transition"
               >
                 + Set Budget
@@ -972,66 +1119,7 @@ export default function App() {
           
           <div className="space-y-6">
             
-            <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 p-5 shadow-xl shadow-slate-950/30">
-              <div className="absolute right-0 top-0 h-24 w-24 rounded-full bg-cyan-500/10 blur-2xl" />
-              <div className="flex items-center justify-between">
-                <h3 className="font-bold text-sm tracking-wide text-slate-400 uppercase">Active Budgets</h3>
-                <span className="text-xs text-slate-500 font-semibold">Total: {activeBudgetsCalculated.length}</span>
-              </div>
-
-              {activeBudgetsCalculated.length === 0 ? (
-                <div className="text-center py-6 bg-slate-950 rounded-xl border border-dashed border-slate-800">
-                  <p className="text-xs text-slate-500">No configured budgets.</p>
-                  <button 
-                    onClick={() => setIsAddBudgetOpen(true)} 
-                    className="text-xs text-emerald-500 hover:underline font-semibold mt-1"
-                  >
-                    Setup Budget
-                  </button>
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  {activeBudgetsCalculated.map(budget => {
-                    const isExceeded = budget.overspent > 0;
-                    return (
-                      <div key={budget.id} className="space-y-1.5 p-3 rounded-xl bg-slate-950 border border-slate-850 hover:border-slate-800 transition">
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <span className="text-xs font-bold text-slate-200 block capitalize">{budget.periodLabel}</span>
-                            <span className="text-[10px] text-slate-500 font-medium">Scope: {budget.scope === 'all' ? 'All sectors' : budget.scope}</span>
-                          </div>
-                          <button
-                            onClick={() => handleDeleteBudget(budget.id)}
-                            className="text-slate-600 hover:text-rose-400 p-1 rounded transition"
-                            title="Delete Budget"
-                          >
-                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-11v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                            </svg>
-                          </button>
-                        </div>
-
-                        <div className="w-full h-2 rounded-full bg-slate-850 overflow-hidden">
-                          <div 
-                            className={`h-full rounded-full transition-all duration-500 ${isExceeded ? 'bg-rose-500' : 'bg-emerald-500'}`}
-                            style={{ width: `${budget.progress}%` }}
-                          />
-                        </div>
-
-                        <div className="flex items-center justify-between text-[11px] font-mono mt-1">
-                          <span className="text-slate-500">Spent: <span className="font-bold text-slate-300">{formatCurrency(budget.spent)}</span></span>
-                          <span className={`${isExceeded ? 'text-rose-400 font-bold' : 'text-slate-500'}`}>
-                            {isExceeded ? `Over: ${formatCurrency(budget.overspent)}` : `Remaining: ${formatCurrency(budget.remaining)}`}
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-
-            <div className="bg-slate-900 border border-slate-850 p-5 rounded-2xl space-y-4">
+                        <div className="bg-slate-900 border border-slate-850 p-5 rounded-2xl space-y-4">
               <h3 className="font-bold text-sm tracking-wide text-slate-400 uppercase">Sector Breakdown</h3>
               
               {sectorBreakdowns.length === 0 ? (
@@ -1046,7 +1134,7 @@ export default function App() {
                       <div key={entry.name} className="space-y-1.5 animate-fadeIn">
                         <div className="flex items-center justify-between text-xs">
                           <div className="flex items-center gap-1.5">
-                            <span className="font-bold text-slate-300">{entry.name}</span>
+                            <button onClick={() => setSectorDetailName(entry.name)} className="font-bold text-slate-300 hover:text-emerald-400 transition">{entry.name}</button>
                             <span className="text-[10px] text-slate-500">({percent}%)</span>
                           </div>
                           <span className="font-mono font-bold text-emerald-400">{formatCurrency(entry.total)}</span>
@@ -1075,76 +1163,7 @@ export default function App() {
               )}
             </div>
 
-            <section className="relative overflow-hidden rounded-3xl border border-indigo-800/60 bg-gradient-to-br from-indigo-950 via-slate-900 to-emerald-950 p-5 shadow-2xl shadow-indigo-950/30">
-              <div className="absolute -right-12 -top-16 h-48 w-48 rounded-full bg-fuchsia-500/20 blur-3xl" />
-              <div className="absolute -bottom-20 left-1/3 h-44 w-44 rounded-full bg-cyan-400/10 blur-3xl" />
-              <div className="relative">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <p className="text-[11px] font-black uppercase tracking-[0.2em] text-indigo-300">Budget at a glance</p>
-                    <h3 className="mt-1 text-xl font-extrabold text-white">Your money map</h3>
-                    <p className="mt-1 text-xs text-slate-300">A quick view of spending against your active plans.</p>
-                  </div>
-                  <button onClick={() => setIsAddBudgetOpen(true)} className="rounded-xl bg-white/10 px-3 py-2 text-xs font-extrabold text-white ring-1 ring-white/15 transition hover:bg-white/20">
-                    + Budget
-                  </button>
-                </div>
 
-                {homeBudgetSummary.totalLimit > 0 ? (
-                  <div className="mt-5 grid grid-cols-[112px_1fr] items-center gap-4 sm:grid-cols-[132px_1fr]">
-                    <div className="relative mx-auto flex h-28 w-28 items-center justify-center rounded-full p-2 sm:h-32 sm:w-32" style={{ background: `conic-gradient(${activeAlerts.length ? '#fb7185' : '#34d399'} ${homeBudgetSummary.progress}%, rgba(255,255,255,0.12) 0)` }}>
-                      <div className="flex h-full w-full flex-col items-center justify-center rounded-full bg-slate-950/95 text-center">
-                        <span className="font-mono text-2xl font-black text-white">{homeBudgetSummary.progress}%</span>
-                        <span className="mt-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">used</span>
-                      </div>
-                    </div>
-                    <div className="space-y-3">
-                      <div className="grid grid-cols-2 gap-2">
-                        <div className="rounded-2xl bg-white/10 p-3 ring-1 ring-white/10">
-                          <p className="text-[10px] font-bold uppercase tracking-wider text-indigo-200">Spent</p>
-                          <p className="mt-1 font-mono text-sm font-extrabold text-white">{formatCurrency(homeBudgetSummary.totalSpent)}</p>
-                        </div>
-                        <div className="rounded-2xl bg-white/10 p-3 ring-1 ring-white/10">
-                          <p className="text-[10px] font-bold uppercase tracking-wider text-indigo-200">Budget</p>
-                          <p className="mt-1 font-mono text-sm font-extrabold text-white">{formatCurrency(homeBudgetSummary.totalLimit)}</p>
-                        </div>
-                      </div>
-                      <p className={`text-xs font-bold ${activeAlerts.length ? 'text-rose-300' : 'text-emerald-300'}`}>
-                        {activeAlerts.length ? `${activeAlerts.length} budget${activeAlerts.length === 1 ? '' : 's'} need attention` : 'Looking good — your plans are on track.'}
-                      </p>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="mt-5 rounded-2xl bg-white/10 p-5 text-center ring-1 ring-white/10">
-                    <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-fuchsia-400 to-indigo-500 text-xl font-black text-white">৳</div>
-                    <p className="mt-3 text-sm font-extrabold text-white">Give your spending a target</p>
-                    <p className="mt-1 text-xs text-slate-300">Create a budget to see your visual money map here.</p>
-                  </div>
-                )}
-
-                {homeBudgetSummary.budgets.length > 0 && (
-                  <div className="mt-5 grid grid-cols-1 gap-2 sm:grid-cols-3">
-                    {homeBudgetSummary.budgets.map((budget, index) => {
-                      const palette = [
-                        'from-cyan-500/25 to-blue-600/20 text-cyan-200',
-                        'from-fuchsia-500/25 to-purple-600/20 text-fuchsia-200',
-                        'from-amber-400/25 to-orange-600/20 text-amber-100'
-                      ][index];
-                      return (
-                        <div key={budget.id} className={`rounded-2xl bg-gradient-to-br ${palette} p-3 ring-1 ring-white/10`}>
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="truncate text-xs font-extrabold">{budget.scope === 'all' ? 'All sectors' : budget.scope}</span>
-                            <span className="text-[10px] font-bold">{Math.round(budget.progress)}%</span>
-                          </div>
-                          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-950/30"><div className="h-full rounded-full bg-white" style={{ width: `${budget.progress}%` }} /></div>
-                          <p className="mt-2 text-[11px] font-semibold text-white/85">{formatCurrency(budget.spent)} of {formatCurrency(budget.limit)}</p>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            </section>
           </div>
 
           <div className="space-y-6">
@@ -1155,11 +1174,22 @@ export default function App() {
                   <p className="text-xs text-slate-500">Newest logs shown first</p>
                 </div>
                 <span className="text-xs font-mono bg-slate-950 border border-slate-800 px-3 py-1 rounded-full text-slate-400 font-bold">
-                  {activeMonthExpenses.length} entries
+                  {filteredLogs.length} entries
                 </span>
               </div>
 
-              {activeMonthExpenses.length === 0 ? (
+              <select
+                value={logSectorFilter}
+                onChange={(e) => setLogSectorFilter(e.target.value)}
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs font-semibold text-slate-300 focus:outline-none"
+              >
+                <option value="all">All sectors</option>
+                {activeSectorsList.map(sec => (
+                  <option key={sec.id} value={sec.name}>{sec.name}</option>
+                ))}
+              </select>
+
+              {filteredLogs.length === 0 ? (
                 <div className="text-center py-16 border border-dashed border-slate-800 rounded-2xl">
                   <div className="w-16 h-16 mx-auto rounded-full bg-slate-950 flex items-center justify-center text-slate-600 mb-4">
                     <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1171,14 +1201,14 @@ export default function App() {
                 </div>
               ) : (
                 <div className="divide-y divide-slate-800/60 max-h-[600px] overflow-y-auto pr-1">
-                  {activeMonthExpenses.map(item => (
+                  {filteredLogs.map(item => (
                     <div 
                       key={item.id} 
                       className="py-3 flex items-center justify-between group hover:bg-slate-950/40 px-2 rounded-xl transition-all"
                     >
                       <div className="space-y-1 pr-4">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="font-bold text-sm text-slate-200">{item.sector}</span>
+                          <button onClick={() => setSectorDetailName(item.sector)} className="font-bold text-sm text-slate-200 hover:text-emerald-400 transition">{item.sector}</button>
                           {item.subCategory && (
                             <span className="text-[10px] bg-slate-950 text-slate-400 border border-slate-850 px-2 py-0.5 rounded-full font-semibold">
                               {item.subCategory}
@@ -1241,12 +1271,83 @@ export default function App() {
                 <p className="mt-1 text-sm text-slate-500">See every sector at a glance, including the ones you have not spent from yet.</p>
               </div>
               <button
-                onClick={() => setIsAddBudgetOpen(true)}
+                onClick={() => openBudgetForm()}
                 className="shrink-0 rounded-xl bg-emerald-500 px-3 py-2 text-xs font-extrabold text-slate-950 shadow-lg shadow-emerald-950/30 transition hover:bg-emerald-400"
               >
                 + Set budget
               </button>
             </div>
+
+            <section className="relative overflow-hidden rounded-3xl border border-indigo-800/60 bg-gradient-to-br from-indigo-950 via-slate-900 to-emerald-950 p-5 shadow-2xl shadow-indigo-950/30">
+              <div className="absolute -right-12 -top-16 h-48 w-48 rounded-full bg-fuchsia-500/20 blur-3xl" />
+              <div className="absolute -bottom-20 left-1/3 h-44 w-44 rounded-full bg-cyan-400/10 blur-3xl" />
+              <div className="relative">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-[11px] font-black uppercase tracking-[0.2em] text-indigo-300">Budget at a glance</p>
+                    <h3 className="mt-1 text-xl font-extrabold text-white">Your money map</h3>
+                    <p className="mt-1 text-xs text-slate-300">A quick view of spending against your active plans.</p>
+                  </div>
+                  <button onClick={() => openBudgetForm()} className="rounded-xl bg-white/10 px-3 py-2 text-xs font-extrabold text-white ring-1 ring-white/15 transition hover:bg-white/20">
+                    + Budget
+                  </button>
+                </div>
+
+                {homeBudgetSummary.totalLimit > 0 ? (
+                  <div className="mt-5 grid grid-cols-[112px_1fr] items-center gap-4 sm:grid-cols-[132px_1fr]">
+                    <div className="relative mx-auto flex h-28 w-28 items-center justify-center rounded-full p-2 sm:h-32 sm:w-32" style={{ background: `conic-gradient(${activeAlerts.length ? '#fb7185' : '#34d399'} ${homeBudgetSummary.progress}%, rgba(255,255,255,0.12) 0)` }}>
+                      <div className="flex h-full w-full flex-col items-center justify-center rounded-full bg-slate-950/95 text-center">
+                        <span className="font-mono text-2xl font-black text-white">{homeBudgetSummary.progress}%</span>
+                        <span className="mt-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">used</span>
+                      </div>
+                    </div>
+                    <div className="space-y-3">
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="rounded-2xl bg-white/10 p-3 ring-1 ring-white/10">
+                          <p className="text-[10px] font-bold uppercase tracking-wider text-indigo-200">Spent</p>
+                          <p className="mt-1 font-mono text-sm font-extrabold text-white">{formatCurrency(homeBudgetSummary.totalSpent)}</p>
+                        </div>
+                        <div className="rounded-2xl bg-white/10 p-3 ring-1 ring-white/10">
+                          <p className="text-[10px] font-bold uppercase tracking-wider text-indigo-200">Budget</p>
+                          <p className="mt-1 font-mono text-sm font-extrabold text-white">{formatCurrency(homeBudgetSummary.totalLimit)}</p>
+                        </div>
+                      </div>
+                      <p className={`text-xs font-bold ${activeAlerts.length ? 'text-rose-300' : 'text-emerald-300'}`}>
+                        {activeAlerts.length ? `${activeAlerts.length} budget${activeAlerts.length === 1 ? '' : 's'} need attention` : 'Looking good — your plans are on track.'}
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-5 rounded-2xl bg-white/10 p-5 text-center ring-1 ring-white/10">
+                    <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-fuchsia-400 to-indigo-500 text-xl font-black text-white">৳</div>
+                    <p className="mt-3 text-sm font-extrabold text-white">Give your spending a target</p>
+                    <p className="mt-1 text-xs text-slate-300">Create a budget to see your visual money map here.</p>
+                  </div>
+                )}
+
+                {homeBudgetSummary.budgets.length > 0 && (
+                  <div className="mt-5 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    {homeBudgetSummary.budgets.map((budget, index) => {
+                      const palette = [
+                        'from-cyan-500/25 to-blue-600/20 text-cyan-200',
+                        'from-fuchsia-500/25 to-purple-600/20 text-fuchsia-200',
+                        'from-amber-400/25 to-orange-600/20 text-amber-100'
+                      ][index];
+                      return (
+                        <div key={budget.id} className={`rounded-2xl bg-gradient-to-br ${palette} p-3 ring-1 ring-white/10`}>
+                          <div className="flex items-center justify-between gap-2">
+                            <button onClick={() => budget.scope !== 'all' && setSectorDetailName(budget.scope)} className="truncate text-left text-xs font-extrabold">{budget.scope === 'all' ? 'All sectors' : budget.scope}</button>
+                            <span className="text-[10px] font-bold">{Math.round(budget.progress)}%</span>
+                          </div>
+                          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-950/30"><div className="h-full rounded-full bg-white" style={{ width: `${budget.progress}%` }} /></div>
+                          <p className="mt-2 text-[11px] font-semibold text-white/85">{formatCurrency(budget.spent)} of {formatCurrency(budget.limit)}</p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </section>
 
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               <div className="col-span-2 rounded-2xl border border-emerald-800/50 bg-gradient-to-br from-emerald-950/70 to-slate-900 p-4 sm:col-span-1">
@@ -1290,7 +1391,7 @@ export default function App() {
                     <div key={sector.id} className="rounded-xl border border-slate-800 bg-slate-950/70 p-4 transition hover:border-slate-700">
                       <div className="flex items-start justify-between gap-3">
                         <div>
-                          <p className="font-bold text-slate-200">{sector.name}</p>
+                          <button onClick={() => setSectorDetailName(sector.name)} className="text-left font-bold text-slate-200 hover:text-emerald-400 transition">{sector.name}</button>
                           <p className={`mt-1 inline-flex rounded-full border px-2 py-0.5 text-[10px] font-bold ${toneClasses.split(' ').slice(2).join(' ')} ${toneClasses.split(' ')[1]}`}>{sector.level}</p>
                         </div>
                         <span className="font-mono text-sm font-extrabold text-emerald-400">{formatCurrency(sector.spent)}</span>
@@ -1306,6 +1407,58 @@ export default function App() {
                   );
                 })}
               </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-850 bg-slate-900 p-4 sm:p-5">
+              <div className="mb-4 flex items-center justify-between">
+                <div>
+                  <h3 className="font-bold text-slate-100">Your budgets</h3>
+                  <p className="text-xs text-slate-500">Edit or remove any plan.</p>
+                </div>
+                <span className="text-xs font-semibold text-slate-500">Total: {activeBudgetsCalculated.length}</span>
+              </div>
+              {activeBudgetsCalculated.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-slate-800 bg-slate-950 py-6 text-center">
+                  <p className="text-xs text-slate-500">No configured budgets.</p>
+                  <button onClick={() => openBudgetForm()} className="mt-1 text-xs font-semibold text-emerald-500 hover:underline">Setup Budget</button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {activeBudgetsCalculated.map(budget => {
+                    const isExceeded = budget.overspent > 0;
+                    return (
+                      <div key={budget.id} className="space-y-1.5 rounded-xl border border-slate-850 bg-slate-950 p-3">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <span className="block text-xs font-bold capitalize text-slate-200">{budget.periodLabel}</span>
+                            <button
+                              onClick={() => budget.scope !== 'all' && setSectorDetailName(budget.scope)}
+                              className="text-[10px] font-medium text-slate-500 hover:text-emerald-400"
+                            >
+                              Scope: {budget.scope === 'all' ? 'All sectors' : budget.scope}
+                            </button>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <button onClick={() => openBudgetForm(budgets[budget.id])} className="rounded p-1 text-slate-500 transition hover:text-emerald-400" title="Edit Budget">
+                              <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                            </button>
+                            <button onClick={() => handleDeleteBudget(budget.id)} className="rounded p-1 text-slate-600 transition hover:text-rose-400" title="Delete Budget">
+                              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-11v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                            </button>
+                          </div>
+                        </div>
+                        <div className="h-2 w-full overflow-hidden rounded-full bg-slate-850">
+                          <div className={`h-full rounded-full transition-all duration-500 ${isExceeded ? 'bg-rose-500' : 'bg-emerald-500'}`} style={{ width: `${budget.progress}%` }} />
+                        </div>
+                        <div className="mt-1 flex items-center justify-between font-mono text-[11px]">
+                          <span className="text-slate-500">Spent: <span className="font-bold text-slate-300">{formatCurrency(budget.spent)}</span></span>
+                          <span className={isExceeded ? 'font-bold text-rose-400' : 'text-slate-500'}>{isExceeded ? `Over: ${formatCurrency(budget.overspent)}` : `Remaining: ${formatCurrency(budget.remaining)}`}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </section>
         )}
@@ -1568,14 +1721,77 @@ export default function App() {
         </div>
       )}
 
+      {/* Sector Detail Modal */}
+      {sectorDetail && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-950/85 backdrop-blur-sm animate-fadeIn" onClick={() => setSectorDetailName(null)}>
+          <div className="bg-slate-900 border border-slate-850 w-full max-w-md rounded-t-2xl sm:rounded-2xl shadow-2xl max-h-[85vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between shrink-0">
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-wider text-emerald-500">Sector · {monthLabelForDetail}</p>
+                <h3 className="font-extrabold text-slate-100 text-lg">{sectorDetail.name}</h3>
+              </div>
+              <button onClick={() => setSectorDetailName(null)} className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
+              </button>
+            </div>
+            <div className="p-5 space-y-4 overflow-y-auto">
+              <div className="rounded-xl border border-emerald-800/50 bg-emerald-950/30 p-4">
+                <p className="text-[11px] font-bold uppercase tracking-wider text-emerald-400/80">Spent this month</p>
+                <p className="mt-1 font-mono text-2xl font-extrabold text-emerald-400">{formatCurrency(sectorDetail.spent)}</p>
+              </div>
+
+              {sectorDetail.budgets.length > 0 ? sectorDetail.budgets.map(b => {
+                const over = b.overspent > 0;
+                return (
+                  <div key={b.id} className="rounded-xl border border-slate-850 bg-slate-950 p-3 space-y-1.5">
+                    <span className="block text-xs font-bold capitalize text-slate-200">{b.periodLabel}</span>
+                    <div className="h-2 w-full overflow-hidden rounded-full bg-slate-850">
+                      <div className={`h-full rounded-full ${over ? 'bg-rose-500' : 'bg-emerald-500'}`} style={{ width: `${b.progress}%` }} />
+                    </div>
+                    <div className="flex items-center justify-between font-mono text-[11px]">
+                      <span className="text-slate-500">{formatCurrency(b.spent)} of {formatCurrency(b.limit)}</span>
+                      <span className={over ? 'font-bold text-rose-400' : 'text-slate-500'}>{over ? `Over: ${formatCurrency(b.overspent)}` : `Left: ${formatCurrency(b.remaining)}`}</span>
+                    </div>
+                  </div>
+                );
+              }) : (
+                <p className="rounded-xl border border-dashed border-slate-800 bg-slate-950 p-3 text-center text-xs text-slate-500">No budget set for this sector.</p>
+              )}
+
+              <div>
+                <h4 className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-500">Logs ({sectorDetail.logs.length})</h4>
+                {sectorDetail.logs.length === 0 ? (
+                  <p className="text-xs text-slate-500">No expenses in this sector this month.</p>
+                ) : (
+                  <div className="divide-y divide-slate-800/60">
+                    {sectorDetail.logs.map(item => (
+                      <div key={item.id} className="flex items-center justify-between py-2.5">
+                        <div>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            {item.subCategory && <span className="text-[10px] bg-slate-950 text-slate-400 border border-slate-850 px-2 py-0.5 rounded-full font-semibold">{item.subCategory}</span>}
+                            <span className="text-[11px] font-mono text-slate-500">{new Date(item.date).toLocaleDateString('default', { day: 'numeric', month: 'short' })}</span>
+                          </div>
+                          {item.note && <p className="mt-0.5 text-xs italic text-slate-400 line-clamp-1">{item.note}</p>}
+                        </div>
+                        <span className="font-mono text-sm font-extrabold text-emerald-400">{formatCurrency(item.amount)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Budget Creator Modal */}
       {isAddBudgetOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-sm animate-fadeIn">
           <div className="bg-slate-900 border border-slate-850 w-full max-w-md rounded-2xl shadow-2xl overflow-hidden">
             <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
-              <h3 className="font-bold text-slate-200 text-base">Configure Smart Budget</h3>
+              <h3 className="font-bold text-slate-200 text-base">{editingBudgetId ? 'Edit Budget' : 'Configure Smart Budget'}</h3>
               <button 
-                onClick={() => setIsAddBudgetOpen(false)}
+                onClick={closeBudgetForm}
                 className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1654,10 +1870,14 @@ export default function App() {
                 </div>
               )}
 
+              {budgetFormError && (
+                <p className="rounded-lg border border-rose-900/50 bg-rose-950/30 px-3 py-2 text-xs font-semibold text-rose-300">{budgetFormError}</p>
+              )}
+
               <div className="pt-2 flex items-center gap-3">
                 <button
                   type="button"
-                  onClick={() => setIsAddBudgetOpen(false)}
+                  onClick={closeBudgetForm}
                   className="w-1/2 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-750 text-slate-300 text-sm font-bold transition"
                 >
                   Cancel
@@ -1666,7 +1886,7 @@ export default function App() {
                   type="submit"
                   className="w-1/2 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-sm font-extrabold transition"
                 >
-                  Apply Budget
+                  {editingBudgetId ? 'Save Changes' : 'Apply Budget'}
                 </button>
               </div>
             </form>
